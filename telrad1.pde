@@ -7,15 +7,15 @@
      128 by 32 OLED display.  Use two pages as 1305 controller has enough ram for a 128 by 64 display
      Band select via I/O expanders and relay drivers.  Bands are 80,60,40,30,20,15.  Could be changed
      with a different plug in bandpass filter.
-     QRP-LABS 5 watt PA with some changes. Raised cosine shaped cw waveform
-        Left off signal leakage gate, Added negative feedback, output transfomer as 2:1 instead of 3:1 .
+     QRP-LABS 5 watt PA. Raised cosine shaped cw waveform
+        Changes: Left off signal leakage gate, Added negative feedback, output transfomer as 2:1 instead of 3:1 .
      
  
 */   
 
 /*   things to implement or consider
   !!! fix the K3 emulation for the 100x frequency changes
-  AM detector fix
+  AM detector fix and AGC
   S  meter
   SWR bridge wiring to A/D converters
   PA temperature wiring
@@ -170,9 +170,15 @@ struct MEMORY {
   int mode;  // cw usb lsb am
 };
 
-#define NOMEM 22
+#define NOMEM 28
 const struct MEMORY memory[NOMEM] = {
-   { "SeaGull Net", 394000000, 0, LSB },     
+   { "SeaGull Net", 394000000, 0, LSB },
+   { "WSPR 80 rx",   359260000, 0, USB },
+   { "WSPR 60 RX",   528720000, 1, USB },
+   { "WSPR 40 rx",   703860000, 2, USB },
+   { "WSPR 30 rx",  1013870000, 3, USB },
+   { "WSPR 20 rx",  1409560000, 4, USB },
+   { "WSPR 15 rx",  2109460000, 5, USB },
    { "W1AW DIGI",   709500000-150000, 2, USB },  
    { "W1AW Code"   , 704750000-80000, 2, CW },   
    { "60m Chan 1",   533050000, 1, USB }, 
@@ -266,6 +272,9 @@ unsigned long mult_timeout;     // time out the display so it looks cleaner
 
 int semi_breakin_timer;
 int ifgain = 100;          // 0 to 100 mapped to inverse 12 bits for D/A
+
+int wspr_duty = 2;
+int wspr_tx_enable;
 
 /*************************************************************************************************/
 
@@ -380,9 +389,7 @@ static int dbounce;
 static int dcount;
 static time_t m;
 static int slow_encode;  // slow down the encoder for menu selection
-
-// static int flip = 0;   // debug
-static int sec;
+static int msec;
 
   while( m == millis()){           // features needing fast code here
      
@@ -400,10 +407,10 @@ static int sec;
   }
   
   m = millis();
-  
-  ++sec;  
-  if( sec == 2000 ){
-    sec = 0;
+  if( mode == WSPR ) wspr_timer(m);
+  ++msec;  
+  if( msec == 2000 ){
+    msec = 0;
   // temperature readings
     if( transmitting ) pa_temp_display(pa_temp);
     else{ 
@@ -412,11 +419,6 @@ static int sec;
                               // !!! revisit this as we have changed how the bfo and vfo are swapped for tx
     }
   }
-
-    // !!! debug. wspr tx this way?   Diddle the c term of the bfo to see what effect it has on the frequency
-  //if( sec == 0 ) i2cd(SI5351,PLLA+1,0xff);    // return to normal
-  //if( sec == 1300 ) i2cd(SI5351,PLLA+1,0x00);   // what effect does this have, NONE. did drift compensation
-                                                  // cause experiment to fail? 
   
 // test to see if this makes noise  hangs when not present??
 // i2cd(D2A_AUDIO,0x55,0xAA);
@@ -849,16 +851,19 @@ int x;
   
   if( tx_inhibit ) OLED.invertText(true);     // if out of band limits the mode is inverse video
   switch (mode){
-     case CW:  OLED.print(" CW  ",16*6,0); break;
-     case LSB: OLED.print(" LSB ",16*6,0); break;
-     case USB: OLED.print(" USB ",16*6,0); break;
-     case AM:  OLED.print(" AM  ",16*6,0); break;
+     case CW:   OLED.print(" CW  ",16*6,0); break;
+     case LSB:  OLED.print(" LSB ",16*6,0); break;
+     case USB:  OLED.print(" USB ",16*6,0); break;
+     case AM:   OLED.print(" AM  ",16*6,0); break;
+     case WSPR: OLED.print(" WSPR",16*6,0); break;
   }
   OLED.invertText(false);
   
   // is the vfo locked
   if( (toggles & LOCK) && (encoder_user == FREQ) ) OLED.print("LK",11*6,1*8);   // 18*6
   else OLED.print("  ",11*6,1*8);
+  
+  if( mode != WSPR ) OLED.clrRow(1,6*18);   // clear the time counter area
   
 }
 
@@ -888,16 +893,14 @@ int x;
 void osc_temp_display( int val ){
   
   //OLED.clrRow(4,0,10*6);
-  //OLED.printNumI(val,LEFT,4*8);   // debug
+  //OLED.printNumI(val/8,LEFT,4*8);   // debug
   //OLED.printNumI(temp_correction,5*6,4*8);
   
    val >>= 3;    // remove oversampled bits
-   val *= 6520;  // 6600;
-   val /= 1024;
-   val -= 2732;
-   val += 20;    // about 2 degrees low. Could be resistor tol. or LM335 tol.
-                 // or 10k series resistance is too high for the uC32 a/d converter
-                 // 1 count is about .6 deg K so fairly touchy measurement
+   val *= 6663;  // vcc * 2 and resistor tolerance 
+   val /= 1023;
+   val -= 2731;
+
    if( val > 600 ) drift_defeat = 1;   // looks like osc temp measuring not working so no drift_compensation
    else drift_defeat = 0;
 
@@ -911,10 +914,9 @@ void osc_temp_display( int val ){
 void pa_temp_display( int val ){
 
   
-   val *= 6520;  // 10k 10k resistor divider, voltage is actually double what is measured
-   val /= 1024;
-   val -= 2732;
-   val += 20; 
+   val *= 6663;  // vcc * 2 and resistor tolerance 
+   val /= 1023;
+   val -= 2731;
 
    OLED.print("pa ",6*14,3*8);
    OLED.printNumI( val/10,6*18,3*8,2,' ');
@@ -1110,12 +1112,12 @@ int val;
 
 void tx_on( ){
 byte temp;
-long bfo_tx;
+uint64_t bfo_tx;
 
   // set power level and move bfo if in CW mode
   set_power();
   temp = 0;
-  bfo_tx = 9000000;
+  bfo_tx = 900000000;
   
   if( mode == CW ){
     bfo_tx -= cw_offset;
@@ -1789,7 +1791,7 @@ audio = sample;
 // called from dsp_core.   CW wave shaping.
 void raised_cosine(){
 static int flip;
-int val;
+unsigned int val;
 
    if( tx_cnt == 0 ) return;    // nothing to do
    flip ^= 1;
@@ -1800,6 +1802,101 @@ int val;
    tx_load(val);
    --tx_cnt;  ++tx_indx;
 }
+
+
+
+//      Download WSPRcode.exe from  http://physics.princeton.edu/pulsar/K1JT/WSPRcode.exe   and run it in a dos window 
+//      Type (for example):   WSPRcode "K1ABC FN33 37"    37 is 5 watts, 30 is 1 watt, 33 is 2 watts, 27 is 1/2 watt
+//      ( Use capital letters in your call and locator when typing in the message string.  No extra spaces )
+//      Using the editing features of the dos window, mark and copy the last group of numbers
+//      Paste into notepad and replace all 3 with "3,"  all 2 with "2," all 1 with "1," all 0 with "0,"
+//      Remove the comma on the end
+//  the current message is   "K1URC FN54 23"
+const char wspr_msg[] = { 
+ 3, 3, 2, 2, 2, 0, 0, 2, 1, 2, 0, 2, 1, 1, 1, 2, 2, 2, 3, 0, 0, 1, 0, 1, 1, 3, 3, 2, 2, 0,
+ 2, 2, 0, 0, 3, 2, 0, 3, 0, 1, 2, 0, 2, 0, 0, 2, 3, 0, 1, 3, 2, 0, 1, 1, 2, 1, 0, 2, 0, 3,
+ 3, 2, 3, 2, 2, 2, 2, 1, 3, 2, 3, 0, 3, 0, 3, 0, 3, 2, 0, 3, 2, 0, 3, 0, 3, 1, 0, 2, 0, 1,
+ 1, 2, 1, 2, 3, 0, 2, 2, 3, 2, 2, 0, 2, 2, 1, 0, 2, 1, 2, 0, 3, 3, 1, 2, 3, 1, 2, 2, 3, 1,
+ 2, 1, 2, 0, 0, 1, 1, 3, 2, 2, 2, 2, 0, 1, 0, 1, 2, 0, 3, 1, 0, 2, 0, 0, 2, 2, 0, 1, 3, 0,
+ 1, 2, 3, 1, 0, 2, 2, 1, 3, 0, 2, 2
+ };
+
+
+/*   WSPR  core timer function */
+// #define WSPRTICK 27307482     // 1 bit time for 1.4648 baud.  
+#define WSPRTICK 27306667        // or should it be 1.46484375 baud.  120000/8192
+
+uint32_t  wspr_core( uint32_t timer ){
+static int count;
+long dds_freq_base;
+uint64_t bfo_tx;
+const int precalc[4] = {0,146,293,439};
+int i;
+
+  if( wspr_tx_enable == 0 )   return timer + WSPRTICK;   // nothing to do
+
+  if( count == 162 ) {   // stop the transmitter
+     tx_off(1);
+     wspr_tx_enable = 0;
+     count = 0;
+   //  update_frequency(NO_DISPLAY_UPDATE);
+     return timer + WSPRTICK;
+  }
+
+  if( count == 0 ) tx_on();
+    
+  //dds_freq_base = ( tx_vfo + mode_offset ) * (268.435456e6 / Reference );    
+  //wspr_to_freq( dds_freq_base + 8L * (long)wspr_msg[count] );
+  bfo_tx = 900000000 - wspr_offset;
+//  bfo_tx -= ((uint64_t)( (float)wspr_msg[count] * 146.484375 )); use the precalc values with rounding
+  i = wspr_msg[count];
+  bfo_tx -= precalc[i];
+  si_pll_x( PLLB, bfo_tx, bfo_divider );
+
+  ++count;
+   
+  return timer + WSPRTICK;    
+}
+
+unsigned long msec,oldtime;
+int sec;
+
+void reset_wspr_times( ){
+ 
+   oldtime = millis();
+   msec = sec = 0; 
+}
+
+// que up auto send wspr messages
+// change to wspr mode on 2 minute mark to sync up the timer
+void wspr_timer(unsigned long ms){
+static int last_time;
+static int wspr_que;
+
+   msec+=  ( ms - oldtime );
+   oldtime = ms;
+   if( msec >= 1000 ){      // one second period
+      msec -= 1000;   
+      if( ++sec >= 120){    // start of a two minute period
+        sec -= 120;
+       // if( led_on_timer == 0 ) set_display(4,4);
+        if( random(100) <  (long)( 5 * wspr_duty )) ++wspr_que;    //1 == 5%,  2 == 10% duty
+        if( wspr_que ){
+          if( last_time ) last_time = 0;
+          else{
+             wspr_tx_enable = last_time = 1;
+             --wspr_que;
+          }                 
+        }
+      }    // end of two minutes
+
+      OLED.invertText(wspr_tx_enable);
+      OLED.printNumI( sec, 6*18,1*8,3,' ');
+      OLED.invertText(false);
+   }  // end of a new one second
+
+}
+
 
 
 /*  I2C write only implementation using polling of the hardware registers */
@@ -1964,6 +2061,7 @@ int ret_val;
               case 2: active_menu = &multi_1_menu; def_val = multi1; state = 3; break;
               case 3: active_menu = &multi_2_menu; def_val = multi2; state = 4; break;              
             }
+            if( transmitting && top_sel < 2 ) tx_off(1);
             def_val = top_menu2(def_val,active_menu, 0 );   // init a new submenu
          break;
          case 1:   // a new band was selected or not
@@ -1975,6 +2073,13 @@ int ret_val;
            // or leave it on for AGC to work ?
              if( mode == AM ) i2cd( SI5351, 3, 0xff ^ 1 );  // just the vfo on
              else i2cd( SI5351, 3, 0xff ^ 0x5 );     // enable both clocks
+             
+             if( mode == WSPR ){
+               reset_wspr_times();
+               attachCoreTimerService( wspr_core );
+             }
+             else detachCoreTimerService( wspr_core );
+             
             load_expander();
             ret_val = state = 0;
          break;   // mode change
